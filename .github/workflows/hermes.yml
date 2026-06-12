@@ -1,0 +1,132 @@
+name: Hermes Agent Desktop - Remote Dashboard v8.0
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  hermes-dashboard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+    - name: System Info
+      run: |
+        echo "══════════════════════════════════════════"
+        echo "  HERMES AGENT DESKTOP v8.0"
+        echo "  Cloudflare Tunnel + Hermes Dashboard"
+        echo "══════════════════════════════════════════"
+        echo "Runner: $(uname -a)"
+        echo "Time:   $(date)"
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y curl wget git ca-certificates ffmpeg openssl
+        curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+        sudo apt-get install -y nodejs
+        echo "Node: $(node --version)"
+        echo "NPM:  $(npm --version)"
+
+    - name: Install Hermes Agent
+      run: |
+        echo "Installing Hermes Agent..."
+        curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+        echo ""
+        echo "Hermes installed to: $HOME/.hermes"
+        export PATH="$HOME/.hermes/bin:$PATH"
+        which hermes
+        hermes --version 2>&1 || true
+
+    - name: Pre-build Dashboard Assets
+      run: |
+        export PATH="$HOME/.hermes/bin:$PATH"
+        echo "Pre-building web UI..."
+        WEB_DIR="$HOME/.hermes/hermes-agent/website/dashboard"
+        if [ -d "$WEB_DIR" ]; then
+          cd "$WEB_DIR"
+          npm install 2>&1 | tail -15 || true
+        else
+          echo "Web dir not found, searching..."
+          find "$HOME/.hermes" -maxdepth 5 -name "package.json" 2>/dev/null
+        fi
+        echo "Hermes binary location:"
+        ls -la "$HOME/.hermes/bin/"
+
+    - name: Start Hermes Dashboard
+      run: |
+        export PATH="$HOME/.hermes/bin:$PATH"
+        SECRET=$(openssl rand -hex 24)
+        echo "::add-mask::$SECRET"
+        echo "HERMES_API_SECRET=$SECRET" >> "$GITHUB_ENV"
+        nohup hermes dashboard --port 9119 --host 0.0.0.0 --insecure --api-secret "$SECRET" > /tmp/dashboard.log 2>&1 &
+        HERME_PID=$!
+        echo "Dashboard PID: $HERME_PID"
+        echo "$HERME_PID" > /tmp/hermes.pid
+
+        echo "Waiting up to 120s for dashboard..."
+        UP=false
+        for i in $(seq 1 60); do
+          sleep 2
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:9119 2>/dev/null || echo "000")
+          if [ "$CODE" = "200" ] || [ "$CODE" = "302" ]; then
+            echo "Dashboard UP (HTTP $CODE in $((i*2))s)"
+            UP=true
+            break
+          fi
+          if [ $((i % 10)) -eq 0 ]; then
+            echo "  ... ${i}/60 (~$((i*2))s elapsed)"
+          fi
+        done
+        if [ "$UP" = "false" ]; then
+          echo "Dashboard not responding after 120s. Log tail:"
+          tail -40 /tmp/dashboard.log && true
+        fi
+
+    - name: Install Cloudflare Tunnel
+      run: |
+        curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+        chmod +x cloudflared
+        sudo mv cloudflared /usr/local/bin/
+
+    - name: Start Cloudflare Tunnel
+      run: |
+        echo "Starting Cloudflare Tunnel to localhost:9119 ..."
+        nohup cloudflared tunnel --url http://127.0.0.1:9119 > /tmp/tunnel.log 2>&1 &
+        echo "Cloudflared PID: $!"
+        sleep 20
+
+        URL=$(grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" /tmp/tunnel.log | head -1)
+        if [ -n "$URL" ]; then
+          echo ""
+          echo "╔════════════════════════════════════════╗"
+          echo "║     Hermes Agent is LIVE ONLINE!       ║"
+          echo "╚════════════════════════════════════════╝"
+          echo "  Public URL: $URL"
+          echo "$URL"        > /tmp/tunnel_url.txt
+          echo "$SECRET"     > /tmp/hermes_secret.txt
+        else
+          echo "Tunnel URL not found yet. Cloudflare log tail:"
+          tail -30 /tmp/tunnel.log
+        fi
+
+    - name: Display Final Connection Info
+      run: |
+        echo ""
+        echo "═══════════════════════════════════════"
+        echo "  Connection Information"
+        echo "═══════════════════════════════════════"
+        [ -f /tmp/tunnel_url.txt ] && echo "  Dashboard URL: $(cat /tmp/tunnel_url.txt)"
+        [ -f /tmp/hermes_secret.txt ] && echo "  Auth Secret:   $(cat /tmp/hermes_secret.txt)"
+        echo "⏱  Runs for 6 hours (360 min)"
+        echo "═══════════════════════════════════════"
+
+    - name: Keep Alive (6 hours)
+      run: |
+        for i in $(seq 360 -1 1); do
+          echo "⏱ Remaining: $i min"
+          if [ $((i % 60)) -eq 0 ]; then
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:9119 2>/dev/null || echo "N/A")
+            echo "  Dashboard status: HTTP $CODE"
+          fi
+          sleep 60
+        done
